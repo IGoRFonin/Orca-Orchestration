@@ -87,7 +87,7 @@ writeFileSync(
   join(out, "package.json"),
   JSON.stringify(
     {
-      name: "orca-dag",
+      name: "@igorfonin/orca-dag",
       version,
       description: rootPkg.description,
       type: "module",
@@ -96,9 +96,11 @@ writeFileSync(
       engines: { node: ">=20" },
       keywords: ["orca", "orchestration", "dag", "agents", "coordinator", "react-flow"],
       license: "MIT",
-      repository: { type: "git", url: "git+https://github.com/ZinkLu/Orca-Orchestration.git" },
-      homepage: "https://github.com/ZinkLu/Orca-Orchestration#readme",
-      bugs: { url: "https://github.com/ZinkLu/Orca-Orchestration/issues" },
+      // Scoped packages publish as restricted unless told otherwise.
+      publishConfig: { access: "public" },
+      repository: { type: "git", url: "git+https://github.com/IGoRFonin/Orca-Orchestration.git" },
+      homepage: "https://github.com/IGoRFonin/Orca-Orchestration#readme",
+      bugs: { url: "https://github.com/IGoRFonin/Orca-Orchestration/issues" },
       // No dependencies on purpose — express and cors are inlined by esbuild.
     },
     null,
