@@ -113,6 +113,8 @@ export interface RunAttempt {
   handle: string | null;
   /** Orca fails the task after 3 consecutive attempt failures. */
   failureCount: number;
+  /** Auto "continue" prompts sent after transient API errors. */
+  nudges?: number;
   lastHeartbeatAt: string | null;
 }
 

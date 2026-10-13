@@ -400,6 +400,10 @@ export interface OrcaTerminal {
   title: string;
   connected: boolean;
   writable: boolean;
+  /** Epoch ms of the pane's last output; null on hosts that predate the field. */
+  lastOutputAt: number | null;
+  /** Agent Orca detected in the pane (`claude`, …), or null for a bare shell. */
+  agentIdentity: string | null;
 }
 
 export async function listTerminals(): Promise<OrcaTerminal[]> {
@@ -412,7 +416,37 @@ export async function listTerminals(): Promise<OrcaTerminal[]> {
     title: String(t.title ?? "").trim(),
     connected: Boolean(t.connected),
     writable: Boolean(t.writable),
+    lastOutputAt: typeof t.lastOutputAt === "number" ? t.lastOutputAt : null,
+    agentIdentity: typeof t.agentIdentity === "string" ? t.agentIdentity : null,
   }));
+}
+
+/**
+ * The pane's rendered screen, one string per row. `--screen` matters: the
+ * default stream read returns TUI repaints as stacked fragments, which is
+ * useless for "what is the agent showing right now".
+ */
+export async function readScreen(handle: string): Promise<string[]> {
+  const result = await runOrca<{ terminal?: { tail?: unknown } }>([
+    "terminal",
+    "read",
+    "--terminal",
+    handle,
+    "--screen",
+  ]);
+  const tail = result.terminal?.tail;
+  return Array.isArray(tail) ? tail.map(String) : [];
+}
+
+/**
+ * Type a line into an agent TUI and submit it. Same dance as the legacy
+ * dispatch below: text sent with `--enter` doesn't always submit into a TUI,
+ * so settle and press Enter once more — on an empty input that's a no-op.
+ */
+export async function sendPrompt(handle: string, text: string): Promise<void> {
+  await runOrca(["terminal", "send", "--terminal", handle, "--text", text, "--enter"]);
+  await sleep(1500);
+  await runOrca(["terminal", "send", "--terminal", handle, "--enter"]).catch(() => {});
 }
 
 /** Title we stamp on our own coordinator terminal so we can find it again. */

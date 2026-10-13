@@ -5,6 +5,9 @@ import {
   ensureCoordinatorTerminal,
   listGates,
   listTasks,
+  listTerminals,
+  readScreen,
+  sendPrompt,
   showDispatch,
   startLegacyWorker,
   startSupervisedWorker,
@@ -13,6 +16,7 @@ import {
   type OrcaTask,
   type StartedWorker,
 } from "./orca";
+import { detectApiErrorStall } from "./nudge";
 
 /**
  * Self-driven coordinator.
@@ -45,6 +49,11 @@ interface Attempt {
   /** Live from `worker-show`, for the UI. */
   failureCount: number;
   lastHeartbeatAt: string | null;
+  /** The pane the worker's agent runs in, from `worker-show`'s assignee. */
+  assigneeHandle: string | null;
+  /** "continue" nudges sent to this Dispatch after an API error (see `nudgeStalled`). */
+  nudges: number;
+  lastNudgeAt: number;
 }
 
 interface StartOpts {
@@ -75,6 +84,27 @@ const TERMINAL_STATUS = new Set(["completed", "failed"]);
 /** Orca rejects these agents for `worker-start`; retry them the legacy way. */
 const UNCONFIGURED_AGENT_CODES = new Set(["agent_unconfigured", "invalid_argument"]);
 
+/**
+ * Auto-continue after transient API errors. `ORCA_DAG_NUDGE=0` turns it off;
+ * `ORCA_DAG_NUDGE_TEXT` changes what gets typed (e.g. "продолжи").
+ */
+const NUDGE_ENABLED = process.env.ORCA_DAG_NUDGE !== "0";
+const NUDGE_TEXT = process.env.ORCA_DAG_NUDGE_TEXT || "continue";
+/**
+ * Quiet time before a nudge, indexed by nudges already sent: first one after
+ * 20s of silence (Claude Code has already exhausted its own retries by the time
+ * it prints the error), then back off so an API outage isn't hammered.
+ */
+const NUDGE_BACKOFF_MS = [20_000, 60_000, 180_000];
+/** A worker that ran this long since our last nudge has recovered; reset its budget. */
+const NUDGE_RESET_MS = 10 * 60_000;
+/**
+ * Only harnesses whose TUI prints `⏺ API Error` and reads a typed prompt.
+ * opencode in particular runs as `opencode run` in a bare shell — "continue"
+ * would land in zsh.
+ */
+const NUDGE_HARNESSES = new Set(["claude"]);
+
 const state: State = {
   running: false,
   runId: null,
@@ -102,6 +132,7 @@ export function coordinatorStatus() {
       handle: a.handle,
       failureCount: a.failureCount,
       lastHeartbeatAt: a.lastHeartbeatAt,
+      nudges: a.nudges,
     })),
     busy: state.attempts.size,
   };
@@ -205,9 +236,12 @@ async function tick(): Promise<void> {
       if (d) {
         attempt.failureCount = d.failure_count ?? 0;
         attempt.lastHeartbeatAt = d.last_heartbeat_at ?? null;
+        attempt.assigneeHandle = d.assignee_handle ?? attempt.assigneeHandle;
       }
     }),
   );
+
+  if (NUDGE_ENABLED) await nudgeStalled();
 
   // Release any task still `blocked` whose entry gate has already been
   // approved. Orca records the gate resolution but does NOT flip the gated
@@ -261,6 +295,9 @@ async function tick(): Promise<void> {
       handle: null,
       failureCount: 0,
       lastHeartbeatAt: null,
+      assigneeHandle: null,
+      nudges: 0,
+      lastNudgeAt: 0,
     };
     state.attempts.set(task.id, attempt);
     return { task, attempt };
@@ -327,6 +364,66 @@ async function startOne(
     state.attempts.delete(task.id);
     state.error = `Failed to start task ${task.id}: ${String((err as Error).message ?? err)}`;
   }
+}
+
+/**
+ * Type "continue" into workers whose agent ended its turn on a transient API
+ * error ("Connection lost mid-response", overloaded, 5xx…).
+ *
+ * Such a worker never calls `worker_done`, so the task stays `dispatched` and
+ * nothing else in this loop would ever move it — not Orca's circuit breaker
+ * (no attempt failed), not the heartbeat (nobody watches it for us). Cheap by
+ * construction: one `terminal list` per tick, and a screen read only for panes
+ * that have been silent past the backoff window.
+ *
+ * Budget is per attempt (`Attempt` is dropped when the task settles, and a
+ * retried task gets a fresh one). Past the budget, or on an error retrying
+ * can't fix, we stop and surface it rather than loop.
+ */
+async function nudgeStalled(): Promise<void> {
+  const candidates = [...state.attempts.values()].filter(
+    (a) => NUDGE_HARNESSES.has(a.harness) && (a.assigneeHandle || a.handle),
+  );
+  if (candidates.length === 0) return;
+
+  const terminals = new Map((await listTerminals()).map((t) => [t.handle, t]));
+  const now = Date.now();
+
+  await Promise.all(
+    candidates.map(async (a) => {
+      const handle = (a.assigneeHandle || a.handle)!;
+      const term = terminals.get(handle);
+      if (!term || !term.writable || term.lastOutputAt == null) return;
+
+      const quietFor = now - term.lastOutputAt;
+      if (a.nudges > 0 && term.lastOutputAt - a.lastNudgeAt > NUDGE_RESET_MS) a.nudges = 0;
+      if (a.nudges >= NUDGE_BACKOFF_MS.length) return;
+      if (quietFor < NUDGE_BACKOFF_MS[a.nudges]) return;
+      // Claude Code titles an idle pane "✳ …" and a busy one with a spinner.
+      if (term.agentIdentity === "claude" && !term.title.startsWith("✳")) return;
+
+      const verdict = detectApiErrorStall(await readScreen(handle).catch(() => []));
+      if (!verdict) return;
+      if (verdict.kind === "fatal") {
+        state.error = `Task ${a.taskId} stopped on an API error a retry won't fix: ${verdict.message}`;
+        return;
+      }
+
+      a.nudges += 1;
+      a.lastNudgeAt = now;
+      try {
+        await sendPrompt(handle, NUDGE_TEXT);
+      } catch (err) {
+        state.error = `Failed to nudge task ${a.taskId}: ${String((err as Error).message ?? err)}`;
+        return;
+      }
+      if (a.nudges >= NUDGE_BACKOFF_MS.length) {
+        state.error =
+          `Task ${a.taskId} hit API errors ${a.nudges} times in a row; sent the last ` +
+          `"${NUDGE_TEXT}" — if it stalls again it needs a human, check its terminal.`;
+      }
+    }),
+  );
 }
 
 function sleep(ms: number): Promise<void> {
