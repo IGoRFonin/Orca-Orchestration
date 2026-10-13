@@ -87,7 +87,7 @@ writeFileSync(
   join(out, "package.json"),
   JSON.stringify(
     {
-      name: "@igorfonin/orca-dag",
+      name: "@ifonin/orca-dag",
       version,
       description: rootPkg.description,
       type: "module",
